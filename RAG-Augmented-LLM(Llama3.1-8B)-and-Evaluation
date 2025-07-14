@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+"""
+Copy of Llama 3.1 8B - RAG- Retrieve, Augment and Generate results - 2nd query- 9th iteration -Humannutrients
+
+Converted from Colab notebook for standalone Python use.
+Original file is located at
+    https://colab.research.google.com/drive/1xxomwi3u-4ViVZftU_N1A2-F7g0C_eZ-
+"""
+
+# Note: Install required packages before running:
+# pip install langchain torch sentence_transformers faiss-cpu huggingface-hub pypdf accelerate llama-cpp-python bitsandbytes chromadb langchain_community ragas arxiv pymupdf wandb tiktoken tqdm nltk rouge-score scikit-learn bert-score
+
+import os
+import requests
+import torch
+from tqdm.auto import tqdm
+import fitz  # PyMuPDF
+
+from langchain.chains import RetrievalQA
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.llms import LlamaCpp, HuggingFacePipeline
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFDirectoryLoader
+from langchain import PromptTemplate, LLMChain
+from transformers import (
+    BitsAndBytesConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    pipeline,
+    GenerationConfig,
+)
+from langchain.schema import Document
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+from langchain.prompts import ChatPromptTemplate
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+)
+
+# Download PDF file if not present
+pdf_path = "HUMANNUTRITION.pdf"
+if not os.path.exists(pdf_path):
+    print("File doesn't exist, downloading...")
+    url = "https://pressbooks.oer.hawaii.edu/humannutrition2/open/download?type=pdf"
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(pdf_path, "wb") as file:
+            file.write(response.content)
+        print(f"The file has been downloaded and saved as {pdf_path}")
+    else:
+        print(f"Failed to download the file. Status code: {response.status_code}")
+else:
+    print(f"File {pdf_path} exists.")
+
+# Text formatting
+def text_formatter(text: str) -> str:
+    cleaned_text = text.replace("\n", " ").strip()
+    return cleaned_text
+
+# Read and process PDF
+def open_and_read_pdf(pdf_path: str) -> list:
+    doc = fitz.open(pdf_path)
+    pages_and_texts = []
+    for page_number, page in tqdm(enumerate(doc)):
+        text = page.get_text()
+        text = text_formatter(text)
+        pages_and_texts.append({
+            "page_number": page_number - 41,  # adjust page numbers, starts at 42
+            "page_char_count": len(text),
+            "page_word_count": len(text.split(" ")),
+            "page_sentence_count_raw": len(text.split(". ")),
+            "page_token_count": len(text) / 4,
+            "text": text
+        })
+    return pages_and_texts
+
+pages_and_texts = open_and_read_pdf(pdf_path=pdf_path)
+print("Sample extracted pages:", pages_and_texts[:2])
+print("Total pages processed:", len(pages_and_texts))
+
+# Split into LangChain Documents
+documents = [
+    Document(page_content=item["text"], metadata={"page_number": item["page_number"]})
+    for item in pages_and_texts
+]
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=20)
+text_chunks = text_splitter.split_documents(documents)
+print("Total text chunks:", len(text_chunks))
+print("Sample chunk:", text_chunks[2].page_content[:300])
+
+# Embeddings
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Vector store
+vector_store = FAISS.from_documents(text_chunks, embedding=embeddings)
+print("Vector store created:", vector_store)
+
+# Load Llama 3.1 8B model
+# NOTE: Token is needed for private models; replace with your token if needed.
+model_4bit = AutoModelForCausalLM.from_pretrained(
+    "NousResearch/Hermes-3-Llama-3.1-8B",
+    quantization_config=quantization_config,
+    token="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",  # Replace for your use!
+).to(device)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "NousResearch/Hermes-3-Llama-3.1-8B", use_auth_token=True
+)
+
+print("Loaded model:", model_4bit)
+print("Loaded tokenizer:", tokenizer)
+
+pipeline_inst = pipeline(
+    "text-generation",
+    model=model_4bit,
+    tokenizer=tokenizer,
+    use_cache=True,
+    device_map="auto",
+    max_length=10000,
+    do_sample=True,
+    top_k=5,
+    num_return_sequences=1,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.eos_token_id,
+)
+
+llm = HuggingFacePipeline(pipeline=pipeline_inst)
+
+# Prompt template for RAG
+template = """
+<|context|>
+You are an AI assistant that follows instruction extremely well.
+Please be truthful and give direct answers
+Answer the question below from context below
+</s>
+<|user|>
+{query}
+</s>
+ <|assistant|>
+"""
+prompt = ChatPromptTemplate.from_template(template)
+
+# Retriever
+retriever = vector_store.as_retriever(search_kwargs={'k': 5})
+
+# RAG chain
+rag_chain = (
+    {"context": retriever, "query": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+# Query and get response
+query = "How is the energy from macronutrients measured on nutrition food labels, and what is the difference between a calorie and a Calorie?"
+response = rag_chain.invoke(query)
+print("Response from Model:", response)
+
+#########################
+# Evaluation Metrics
+#########################
+
+import nltk
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from sklearn.metrics import precision_score, recall_score, f1_score
+import numpy as np
+import bert_score
+
+# Download NLTK data if needed
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+def evaluate_rag_model(predictions, references):
+    # BLEU score
+    bleu_scores = []
+    for prediction, reference in zip(predictions, references):
+        reference_tokens = nltk.word_tokenize(reference.lower())
+        prediction_tokens = nltk.word_tokenize(prediction.lower())
+        smoothie = SmoothingFunction().method1
+        bleu_score = sentence_bleu([reference_tokens], prediction_tokens, smoothing_function=smoothie)
+        bleu_scores.append(bleu_score)
+    avg_bleu_score = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0
+
+    # ROUGE score
+    rouge_scorer_instance = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    rouge_scores = {'rouge1': [], 'rouge2': [], 'rougeL': []}
+    for prediction, reference in zip(predictions, references):
+        scores = rouge_scorer_instance.score(reference, prediction)
+        rouge_scores['rouge1'].append(scores['rouge1'].fmeasure)
+        rouge_scores['rouge2'].append(scores['rouge2'].fmeasure)
+        rouge_scores['rougeL'].append(scores['rougeL'].fmeasure)
+    avg_rouge_scores = {
+        'rouge1': sum(rouge_scores['rouge1']) / len(rouge_scores['rouge1']),
+        'rouge2': sum(rouge_scores['rouge2']) / len(rouge_scores['rouge2']),
+        'rougeL': sum(rouge_scores['rougeL']) / len(rouge_scores['rougeL']),
+    }
+    results = {
+        'avg_bleu_score': avg_bleu_score,
+        'avg_rouge1_score': avg_rouge_scores['rouge1'],
+        'avg_rouge2_score': avg_rouge_scores['rouge2'],
+        'avg_rougeL_score': avg_rouge_scores['rougeL'],
+    }
+    return results
+
+def calculate_metrics(y_true, y_pred):
+    # Tokenize and convert texts to a binary representation (1 if word exists in text, else 0)
+    y_true_tokens = [set(true.split()) for true in y_true]
+    y_pred_tokens = [set(pred.split()) for pred in y_pred]
+    all_words = set([word for sublist in y_true_tokens + y_pred_tokens for word in sublist])
+    y_true_binary = [[1 if word in tokens else 0 for word in all_words] for tokens in y_true_tokens]
+    y_pred_binary = [[1 if word in tokens else 0 for word in all_words] for tokens in y_pred_tokens]
+    y_true_array = np.array(y_true_binary)
+    y_pred_array = np.array(y_pred_binary)
+    precision = precision_score(y_true_array, y_pred_array, average='micro')
+    recall = recall_score(y_true_array, y_pred_array, average='micro')
+    f1 = f1_score(y_true_array, y_pred_array, average='micro')
+    return precision, recall, f1
+
+# Example ground truth and generated output
+references = ["The energy is measured in Calories on food labels, which actually refers to kilocalories (1,000 calories). A calorie (small “c”) is a single unit of energy, while a Calorie (capital “C”) is equal to 1,000 small calories.."]
+predictions = [response]
+
+results = evaluate_rag_model(predictions, references)
+print("Evaluation Results:")
+print(f"Average BLEU Score: {results['avg_bleu_score']:.4f}")
+print(f"Average ROUGE-1 Score: {results['avg_rouge1_score']:.4f}")
+print(f"Average ROUGE-2 Score: {results['avg_rouge2_score']:.4f}")
+print(f"Average ROUGE-L Score: {results['avg_rougeL_score']:.4f}")
+
+precision, recall, f1 = calculate_metrics(references, predictions)
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1 Score: {f1:.4f}")
+
+# BERTScore
+P, R, F1 = bert_score.score(predictions, references, lang="en")
+print(f"BERTScore Precision: {P.mean():.4f}")
+print(f"BERTScore Recall: {R.mean():.4f}")
+print(f"BERTScore F1-score: {F1.mean():.4f}")
