@@ -1,0 +1,240 @@
+"""
+RAG-Augmented LLM: Humannutrition Example
+Converted from Colab notebook:
+https://github.com/aparnavinayankozhipuram/Mistral-7B-Evaluation/blob/main/19_APRIL_RAG_Retrieve%2C_Augment_and_Generate_results_10th_query_2nd_iteration_Humannutrients.ipynb
+
+Original notebook link for reference:
+https://colab.research.google.com/github/aparnavinayankozhipuram/Mistral-7B-Evaluation/blob/main/19_APRIL_RAG_Retrieve%2C_Augment_and_Generate_results_10th_query_2nd_iteration_Humannutrients.ipynb
+"""
+
+# ================================
+# 1. Install Required Libraries
+# ================================
+# In Colab these are executed with !pip, for local run use your environment manager (e.g. requirements.txt, pip install ...)
+
+# Example requirements.txt (not installed on script run):
+# langchain
+# torch
+# sentence_transformers
+# faiss-cpu
+# huggingface-hub
+# pypdf
+# accelerate
+# llama-cpp-python
+# bitsandbytes
+# chromadb
+# langchain_community
+# ragas
+# arxiv
+# pymupdf
+# wandb
+# tiktoken
+
+# ================================
+# 2. Import Libraries
+# ================================
+from langchain.chains import RetrievalQA
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.llms import LlamaCpp
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFDirectoryLoader
+import torch
+from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer, pipeline, GenerationConfig
+from langchain import HuggingFacePipeline, PromptTemplate, LLMChain
+import os
+import requests
+
+# ================================
+# 3. Device and Quantization Setup
+# ================================
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+)
+
+# ================================
+# 4. Download PDF Document
+# ================================
+pdf_path = "HUMANNUTRITION.pdf"
+if not os.path.exists(pdf_path):
+    print("File doesn't exist, downloading...")
+    url = "https://pressbooks.oer.hawaii.edu/humannutrition2/open/download?type=pdf"
+    response = requests.get(url)
+    with open(pdf_path, "wb") as f:
+        f.write(response.content)
+    print("The file has been downloaded and saved as HUMANNUTRITION.pdf")
+else:
+    print("PDF already exists. Skipping download.")
+
+# ================================
+# 5. Load PDF Documents
+# ================================
+# Directory loader expects directory, so let's use current directory.
+pdf_loader = PyPDFDirectoryLoader(".")
+documents = pdf_loader.load()
+print(f"Loaded {len(documents)} documents from {pdf_path}")
+
+# ================================
+# 6. Split Documents into Chunks
+# ================================
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+docs = text_splitter.split_documents(documents)
+print(f"Split documents into {len(docs)} chunks.")
+
+# ================================
+# 7. Generate Embeddings for Chunks
+# ================================
+embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
+embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
+print(f"Embeddings model loaded: {embedding_model_name}")
+
+# ================================
+# 8. Build FAISS Vector Store
+# ================================
+vectorstore = FAISS.from_documents(docs, embeddings)
+print("FAISS vectorstore created.")
+
+# ================================
+# 9. Setup Llama LLM Pipeline
+# ================================
+llm_model_path = "TheBloke/Mistral-7B-Instruct-v0.2-GPTQ"
+llm = LlamaCpp(
+    model_path=llm_model_path,
+    temperature=0.2,
+    max_new_tokens=256,
+    top_p=1,
+    verbose=True,
+    device=device,
+    quantization_config=quantization_config,
+)
+print("LlamaCpp model loaded.")
+
+# ================================
+# 10. RetrievalQA Chain
+# ================================
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=vectorstore.as_retriever(),
+    return_source_documents=True,
+)
+print("RetrievalQA chain setup complete.")
+
+# ================================
+# 11. Run QA Example Query
+# ================================
+query = "What are key nutrients for human health?"
+result = qa_chain({"query": query})
+print("QA Result:")
+print(result["result"])
+print("Source Documents:")
+for doc in result["source_documents"]:
+    print(doc.metadata.get("source", ""), doc.page_content[:200], "...")
+
+
+# RAG Score Evaluation Example
+
+- **Goal:** Provide code and examples for evaluating the output of RAG or other NLP models using standard metrics.
+- **Metrics Used:** BLEU, ROUGE-1/2/L, Precision, Recall, F1, and BERTScore.
+- **Implementation:** Python functions for each metric, along with example usage and sample outputs.
+
+---
+
+## Getting Started
+
+
+### Installation
+
+Install the required packages using pip:
+
+```bash
+pip install nltk rouge-score scikit-learn bert-score
+```
+
+For first-time use of NLTK, you may need to download the required corpora:
+
+```python
+import nltk
+nltk.download('punkt')
+```
+
+---
+
+## Usage
+
+1. **Model Output and References:**  
+   Prepare two lists: `predictions` (model outputs) and `references` (ground truth).
+
+2. **Evaluation:**  
+   Use the provided Python functions to compute the metrics.
+
+Example:
+```python
+from evaluation import evaluate_rag_model, calculate_metrics
+# predictions = [...]
+# references = [...]
+results = evaluate_rag_model(predictions, references)
+precision, recall, f1 = calculate_metrics(references, predictions)
+```
+
+3. **BERTScore:**
+```python
+import bert_score
+P, R, F1 = bert_score.score(predictions, references, lang="en")
+```
+
+4. **Run the notebook/script:**  
+   See the notebook for full code and example outputs.
+
+---
+
+## Repository Structure
+
+- `16_April_MIT_RAG_Score_Evaluation_12th_query_2nd_iteration.ipynb` — Main Colab notebook with all evaluation code and examples.
+- `README.md` — Project documentation.
+- `evaluation.py` — (Optional) You can extract the Python functions from the notebook into a reusable script.
+
+---
+
+## Example Output
+
+```
+Evaluation Results:
+Average BLEU Score: 0.0814
+Average ROUGE-1 Score: 0.3659
+Average ROUGE-2 Score: 0.1750
+Average ROUGE-L Score: 0.2927
+
+Precision: 0.2619
+Recall: 0.4783
+F1 Score: 0.3385
+
+BERTScore:
+Precision: 0.8905
+Recall: 0.9272
+F1-score: 0.9085
+```
+
+---
+
+## References
+
+- [NLTK](https://www.nltk.org/)
+- [ROUGE Score](https://pypi.org/project/rouge-score/)
+- [Scikit-learn](https://scikit-learn.org/)
+- [BERTScore](https://github.com/Tiiiger/bert_score)
+- [Original Colab Notebook](https://github.com/aparnavinayankozhipuram/Mistral-7B-Evaluation/blob/main/16_April_MIT_RAG_Score_Evaluation_12th_query_2nd_iteration.ipynb)
+
+---
+
+## Contact
+
+For questions or feedback, [open an issue](https://github.com/aparnavinayankozhipuram/Mistral-7B-Evaluation/issues).
